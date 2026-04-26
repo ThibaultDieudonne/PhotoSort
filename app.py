@@ -35,10 +35,11 @@ except ImportError:
 from PIL import Image, ImageOps, UnidentifiedImageError  # noqa: E402
 
 from PySide6.QtCore import Qt, QThread, Signal, QUrl, QTimer  # noqa: E402
-from PySide6.QtGui import QImage, QPixmap  # noqa: E402
+from PySide6.QtGui import QImage, QPixmap, QKeySequence  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QStackedWidget, QSizePolicy,
+    QDialog, QDialogButtonBox, QCheckBox, QGridLayout,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput  # noqa: E402
 from PySide6.QtMultimediaWidgets import QVideoWidget  # noqa: E402
@@ -59,6 +60,23 @@ VIDEO_EXTS = frozenset({
     ".flv", ".m4v", ".webm", ".ts", ".mts",
 })
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+
+class AppSettings:
+    """User-configurable preferences (in-process only, not persisted to disk)."""
+
+    def __init__(self):
+        self.key_keep: int = Qt.Key.Key_K
+        self.key_discard: int = Qt.Key.Key_D
+        self.auto_discard_mov_for_heic: bool = False
+
+    def key_name(self, key) -> str:
+        return QKeySequence(key).toString() or "?"
+
 
 # ---------------------------------------------------------------------------
 # Folder helpers
@@ -318,9 +336,10 @@ class SorterWidget(QWidget):
 
     done = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
 
+        self._settings = settings
         self._root: Path | None = None
         self._keep_folder: Path | None = None
         self._discard_folder: Path | None = None
@@ -343,12 +362,19 @@ class SorterWidget(QWidget):
         self._display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self._display)
 
-        hint = QLabel("← → navigate  ·  K keep  ·  D discard")
-        hint.setAlignment(Qt.AlignCenter)
-        hint.setStyleSheet("font-size: 12px; color: #555; padding: 2px;")
-        layout.addWidget(hint)
+        self._hint = QLabel()
+        self._hint.setAlignment(Qt.AlignCenter)
+        self._hint.setStyleSheet("font-size: 12px; color: #555; padding: 2px;")
+        layout.addWidget(self._hint)
 
         self.setFocusPolicy(Qt.StrongFocus)
+        self.update_hint()
+
+    def update_hint(self) -> None:
+        """Refresh the key-hint label from current settings."""
+        k = self._settings.key_name(self._settings.key_keep)
+        d = self._settings.key_name(self._settings.key_discard)
+        self._hint.setText(f"← → navigate  ·  {k} keep  ·  {d} discard")
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -367,6 +393,11 @@ class SorterWidget(QWidget):
         self._keep_folder = keep_folder
         self._discard_folder = discard_folder
         self._remaining = list(files)
+
+        auto_discarded = 0
+        if self._settings.auto_discard_mov_for_heic:
+            auto_discarded = self._auto_discard_mov_for_heic()
+
         self._current_idx = 0
 
         self._preloader = MediaPreloader(self)
@@ -375,6 +406,10 @@ class SorterWidget(QWidget):
 
         self._reprioritize()
         self._show_current()
+        if auto_discarded:
+            self._status.setText(
+                self._status.text() + f"  ·  auto-discarded {auto_discarded} .MOV"
+            )
         self.setFocus()
 
     def cleanup(self) -> None:
@@ -383,6 +418,39 @@ class SorterWidget(QWidget):
             self._preloader.wait()
             self._preloader = None
         self._display.cleanup()
+
+    def _auto_discard_mov_for_heic(self) -> int:
+        """
+        Move .MOV files to _discarded when a same-stem .HEIC/.HEIF exists in
+        the same directory.  Returns the number of files moved.
+        """
+        heic_keys: set[tuple[str, str]] = set()
+        for p in self._remaining:
+            if p.suffix.lower() in {".heic", ".heif"}:
+                heic_keys.add((str(p.parent.resolve()), p.stem.lower()))
+
+        to_remove: list[int] = []
+        for i, p in enumerate(self._remaining):
+            if p.suffix.lower() == ".mov":
+                if (str(p.parent.resolve()), p.stem.lower()) in heic_keys:
+                    to_remove.append(i)
+
+        count = 0
+        for i in reversed(to_remove):
+            p = self._remaining[i]
+            try:
+                rel = p.relative_to(self._root)
+            except ValueError:
+                rel = Path(p.name)
+            dest = self._discard_folder / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(p), str(dest))
+                self._remaining.pop(i)
+                count += 1
+            except OSError:
+                pass
+        return count
 
     # ── Display ──────────────────────────────────────────────────────────
 
@@ -425,9 +493,9 @@ class SorterWidget(QWidget):
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
-        if key == Qt.Key_K:
+        if key == self._settings.key_keep:
             self._process("keep")
-        elif key == Qt.Key_D:
+        elif key == self._settings.key_discard:
             self._process("discard")
         elif key == Qt.Key_Left and self._current_idx > 0:
             self._current_idx -= 1
@@ -484,6 +552,208 @@ class SorterWidget(QWidget):
 
         self._preloader.update_queue(ordered)
         self._preloader.evict({str(p) for p in ordered})
+
+
+# ---------------------------------------------------------------------------
+# KeyCaptureButton
+# ---------------------------------------------------------------------------
+
+class KeyCaptureButton(QPushButton):
+    """
+    A button that enters 'press a key' mode when clicked, captures the next
+    key press, and emits *key_captured(int)*.  Arrow keys, Escape and other
+    reserved navigation keys are rejected.
+    """
+
+    _RESERVED = frozenset({
+        Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down,
+        Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Enter,
+        Qt.Key.Key_Tab, Qt.Key.Key_Backtab,
+    })
+    _MODIFIERS = frozenset({
+        Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt,
+        Qt.Key.Key_Meta, Qt.Key.Key_AltGr,
+    })
+
+    key_captured = Signal(int)
+
+    def __init__(self, key, parent=None):
+        super().__init__(parent)
+        self._key = key
+        self._listening = False
+        self.setFixedWidth(120)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._apply_normal_style()
+        self._refresh_text()
+        self.clicked.connect(self._start_listening)
+
+    def set_key(self, key) -> None:
+        self._key = key
+        if not self._listening:
+            self._refresh_text()
+
+    def _start_listening(self) -> None:
+        self._listening = True
+        self.setText("Press a key…")
+        self._apply_listen_style()
+        self.setFocus()
+
+    def keyPressEvent(self, event) -> None:
+        if not self._listening:
+            super().keyPressEvent(event)
+            return
+        key = event.key()
+        if key in self._MODIFIERS or key in self._RESERVED:
+            return
+        self._listening = False
+        self._key = key
+        self._refresh_text()
+        self._apply_normal_style()
+        self.key_captured.emit(int(key))
+
+    def focusOutEvent(self, event) -> None:
+        if self._listening:
+            self._listening = False
+            self._refresh_text()
+            self._apply_normal_style()
+        super().focusOutEvent(event)
+
+    def _refresh_text(self) -> None:
+        self.setText(QKeySequence(self._key).toString() or "?")
+
+    def _apply_normal_style(self) -> None:
+        self.setStyleSheet(
+            "QPushButton { background:#2a2a2a; color:#ddd; border:1px solid #444;"
+            " border-radius:4px; font-size:13px; padding:4px 8px; }"
+            "QPushButton:hover { background:#333; }"
+        )
+
+    def _apply_listen_style(self) -> None:
+        self.setStyleSheet(
+            "QPushButton { background:#1a3a5a; color:#7bc; border:1px solid #4af;"
+            " border-radius:4px; font-size:13px; padding:4px 8px; }"
+        )
+
+
+# ---------------------------------------------------------------------------
+# OptionsDialog
+# ---------------------------------------------------------------------------
+
+class OptionsDialog(QDialog):
+    def __init__(self, settings: AppSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Options")
+        self.setMinimumWidth(360)
+        self.setModal(True)
+        self.setStyleSheet("""
+            QDialog { background: #1e1e1e; }
+            QLabel  { background: transparent; color: #ddd; font-size: 13px; }
+            QCheckBox { background: transparent; color: #ddd; font-size: 13px; }
+            QCheckBox::indicator {
+                width: 16px; height: 16px;
+                border: 1px solid #666; border-radius: 3px;
+                background: #2e2e2e;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #999; background: #383838;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #3a7bd5; border-color: #5a9bf5;
+            }
+        """)
+
+        self._settings = settings
+        # Work on temporaries; commit only on OK.
+        self._tmp_keep = settings.key_keep
+        self._tmp_discard = settings.key_discard
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(14)
+        layout.setContentsMargins(20, 20, 20, 16)
+
+        # ── Key bindings ──────────────────────────────────────────────────
+        lbl_bindings = QLabel("Key bindings")
+        lbl_bindings.setStyleSheet(
+            "font-weight: bold; color: #eee; font-size: 14px; background: transparent;"
+        )
+        layout.addWidget(lbl_bindings)
+
+        grid = QGridLayout()
+        grid.setColumnStretch(0, 1)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+
+        grid.addWidget(QLabel("Keep:"), 0, 0)
+        self._btn_keep = KeyCaptureButton(settings.key_keep)
+        self._btn_keep.key_captured.connect(self._on_keep_captured)
+        grid.addWidget(self._btn_keep, 0, 1)
+
+        grid.addWidget(QLabel("Discard:"), 1, 0)
+        self._btn_discard = KeyCaptureButton(settings.key_discard)
+        self._btn_discard.key_captured.connect(self._on_discard_captured)
+        grid.addWidget(self._btn_discard, 1, 1)
+
+        layout.addLayout(grid)
+
+        # ── Behaviour ─────────────────────────────────────────────────────
+        lbl_behaviour = QLabel("Behaviour")
+        lbl_behaviour.setStyleSheet(
+            "font-weight: bold; color: #eee; font-size: 14px;"
+            " margin-top: 4px; background: transparent;"
+        )
+        layout.addWidget(lbl_behaviour)
+
+        self._chk_mov = QCheckBox("Discard MOV when HEIC is present")
+        self._chk_mov.setChecked(settings.auto_discard_mov_for_heic)
+        self._chk_mov.setToolTip(
+            "When opening a folder, automatically move a .MOV file to _discarded\n"
+            "if a file with the same name but a .HEIC extension exists in the same\n"
+            "directory. Takes effect the next time you open a folder."
+        )
+        layout.addWidget(self._chk_mov)
+
+        # ── Buttons ───────────────────────────────────────────────────────
+        _btn_style = """
+            QPushButton {
+                background: #2a2a2a; color: #ddd;
+                border: 1px solid #444; border-radius: 4px;
+                padding: 5px 18px; font-size: 13px;
+            }
+            QPushButton:hover   { background: #333; }
+            QPushButton:default {
+                background: #3a7bd5; color: white; border-color: #3a7bd5;
+            }
+            QPushButton:default:hover { background: #4e8fec; }
+        """
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.setStyleSheet(_btn_style)
+        buttons.accepted.connect(self._apply)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    # ── Conflict resolution ───────────────────────────────────────────────
+
+    def _on_keep_captured(self, key: int) -> None:
+        self._tmp_keep = key
+        if key == self._tmp_discard:
+            fallback = int(Qt.Key.Key_D) if key != int(Qt.Key.Key_D) else int(Qt.Key.Key_X)
+            self._tmp_discard = fallback
+            self._btn_discard.set_key(fallback)
+
+    def _on_discard_captured(self, key: int) -> None:
+        self._tmp_discard = key
+        if key == self._tmp_keep:
+            fallback = int(Qt.Key.Key_K) if key != int(Qt.Key.Key_K) else int(Qt.Key.Key_Z)
+            self._tmp_keep = fallback
+            self._btn_keep.set_key(fallback)
+
+    def _apply(self) -> None:
+        self._settings.key_keep = self._tmp_keep
+        self._settings.key_discard = self._tmp_discard
+        self._settings.auto_discard_mov_for_heic = self._chk_mov.isChecked()
+        self.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -574,16 +844,51 @@ class PhotoSortApp(QMainWindow):
         self.resize(1200, 800)
         self.setStyleSheet("QMainWindow, QWidget { background: #1a1a1a; }")
 
+        self._settings = AppSettings()
+
+        # ── Central wrapper: persistent top bar + page stack ─────────────
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        top_bar = QWidget()
+        top_bar.setFixedHeight(34)
+        top_bar.setStyleSheet("background: #141414; border-bottom: 1px solid #222;")
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(8, 0, 8, 0)
+        top_layout.addStretch()
+        opts_btn = QPushButton("⚙  Options")
+        opts_btn.setFixedHeight(24)
+        opts_btn.setStyleSheet("""
+            QPushButton {
+                background: #2a2a2a; color: #aaa;
+                border: 1px solid #333; border-radius: 4px;
+                font-size: 12px; padding: 0 12px;
+            }
+            QPushButton:hover   { background: #333; color: #eee; }
+            QPushButton:pressed { background: #222; }
+        """)
+        opts_btn.clicked.connect(self._open_options)
+        top_layout.addWidget(opts_btn)
+        root_layout.addWidget(top_bar)
+
         self._stack = QStackedWidget()
-        self.setCentralWidget(self._stack)
+        root_layout.addWidget(self._stack)
 
         self._welcome = WelcomePage()
         self._welcome.folder_selected.connect(self._start_sorting)
         self._stack.addWidget(self._welcome)    # index 0
 
-        self._sorter = SorterWidget()
+        self._sorter = SorterWidget(self._settings)
         self._sorter.done.connect(self._return_home)
         self._stack.addWidget(self._sorter)     # index 1
+
+    def _open_options(self) -> None:
+        dlg = OptionsDialog(self._settings, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._sorter.update_hint()
 
     def _start_sorting(self, root: Path) -> None:
         keep, discard = setup_folder(root)
