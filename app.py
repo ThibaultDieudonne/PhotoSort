@@ -39,7 +39,7 @@ from PySide6.QtGui import QImage, QPixmap, QKeySequence  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QStackedWidget, QSizePolicy,
-    QDialog, QDialogButtonBox, QCheckBox, QGridLayout,
+    QDialog, QDialogButtonBox, QCheckBox, QGridLayout, QDoubleSpinBox,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput  # noqa: E402
 from PySide6.QtMultimediaWidgets import QVideoWidget  # noqa: E402
@@ -73,6 +73,7 @@ class AppSettings:
         self.key_keep: int = Qt.Key.Key_K
         self.key_discard: int = Qt.Key.Key_D
         self.auto_discard_mov_for_heic: bool = False
+        self.video_playback_speed: float = 1.0
 
     def key_name(self, key) -> str:
         return QKeySequence(key).toString() or "?"
@@ -251,6 +252,8 @@ class MediaDisplayWidget(QWidget):
         self._audio = QAudioOutput(self)
         self._player.setAudioOutput(self._audio)
         self._player.setVideoOutput(self._video_widget)
+        self._player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self._playback_speed: float = 1.0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -277,8 +280,14 @@ class MediaDisplayWidget(QWidget):
         self._active_temp = tmp
         self._purge_old_temps()
         self._player.setSource(QUrl.fromLocalFile(tmp))
+        self._player.setPlaybackRate(self._playback_speed)
         self._player.play()
         self._stack.setCurrentIndex(1)
+
+    def set_playback_speed(self, speed: float) -> None:
+        self._playback_speed = speed
+        if self._stack.currentIndex() == 1:
+            self._player.setPlaybackRate(speed)
 
     def show_placeholder(self, text: str) -> None:
         self._player.stop()
@@ -316,6 +325,11 @@ class MediaDisplayWidget(QWidget):
                 size, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
         )
+
+    def _on_media_status_changed(self, status) -> None:
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._player.setPosition(0)
+            self._player.play()
 
     def _purge_old_temps(self) -> None:
         still_locked: list[str] = []
@@ -375,6 +389,10 @@ class SorterWidget(QWidget):
         k = self._settings.key_name(self._settings.key_keep)
         d = self._settings.key_name(self._settings.key_discard)
         self._hint.setText(f"← → navigate  ·  {k} keep  ·  {d} discard")
+
+    def apply_playback_speed(self) -> None:
+        """Push the current speed setting to the display widget immediately."""
+        self._display.set_playback_speed(self._settings.video_playback_speed)
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -712,6 +730,33 @@ class OptionsDialog(QDialog):
         )
         layout.addWidget(self._chk_mov)
 
+        # ── Playback ──────────────────────────────────────────────────────
+        lbl_playback = QLabel("Playback")
+        lbl_playback.setStyleSheet(
+            "font-weight: bold; color: #eee; font-size: 14px;"
+            " margin-top: 4px; background: transparent;"
+        )
+        layout.addWidget(lbl_playback)
+
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("Video speed:"))
+        self._spin_speed = QDoubleSpinBox()
+        self._spin_speed.setRange(1.0, 4.0)
+        self._spin_speed.setSingleStep(0.25)
+        self._spin_speed.setDecimals(2)
+        self._spin_speed.setValue(settings.video_playback_speed)
+        self._spin_speed.setSuffix("x")
+        self._spin_speed.setFixedWidth(90)
+        self._spin_speed.setStyleSheet(
+            "QDoubleSpinBox { background:#2a2a2a; color:#ddd; border:1px solid #444;"
+            " border-radius:4px; padding:3px 6px; font-size:13px; }"
+            "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button"
+            " { background:#333; border:none; width:18px; }"
+        )
+        speed_row.addWidget(self._spin_speed)
+        speed_row.addStretch()
+        layout.addLayout(speed_row)
+
         # ── Buttons ───────────────────────────────────────────────────────
         _btn_style = """
             QPushButton {
@@ -753,6 +798,7 @@ class OptionsDialog(QDialog):
         self._settings.key_keep = self._tmp_keep
         self._settings.key_discard = self._tmp_discard
         self._settings.auto_discard_mov_for_heic = self._chk_mov.isChecked()
+        self._settings.video_playback_speed = self._spin_speed.value()
         self.accept()
 
 
@@ -889,6 +935,7 @@ class PhotoSortApp(QMainWindow):
         dlg = OptionsDialog(self._settings, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._sorter.update_hint()
+            self._sorter.apply_playback_speed()
 
     def _start_sorting(self, root: Path) -> None:
         keep, discard = setup_folder(root)
